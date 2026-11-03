@@ -470,6 +470,7 @@ bool ImprovSerialComponent::network_rpc_(uint8_t code) {
       sta.set_password(args[1].c_str());
       sta.set_hidden(args[2] == "1");
       if (args[3] == "static") {
+#ifdef USE_WIFI_MANUAL_IP
         wifi::ManualIP manual{};
         if (args.size() < 7 || !ip_of(args[4], manual.static_ip) || !ip_of(args[5], manual.subnet) ||
             !ip_of(args[6], manual.gateway) || !optional_ip(args.size() > 7 ? args[7] : "", manual.dns1) ||
@@ -478,6 +479,10 @@ bool ImprovSerialComponent::network_rpc_(uint8_t code) {
           return true;
         }
         sta.set_manual_ip(manual);
+#else
+        this->set_error_(improv::ERROR_INVALID_RPC);
+        return true;
+#endif
       }
       ESP_LOGD(TAG, "Received network settings: SSID=%s", args[0].c_str());
       this->provision_(sta);
