@@ -96,7 +96,7 @@ Each `pr/` branch holds one part of this topic on top of upstream and says in it
 | `pr/boot-announce` | `pr/network-priority` |
 | `pr/esp32-hosted-update-sources` | `pr/storage` of p1ngb4ck/esphome-storage-interface |
 | `pr/ethernet-runtime` | `pr/esp32-nvs-defaults` of p1ngb4ck/esphome-storage-drivers |
-| `pr/improv-serial-identity` | `pr/network-name-from-nvs` |
+| `pr/improv-serial-identity` | `pr/improv-serial-network`, `pr/network-name-from-nvs` |
 | `pr/improv-serial-network` | upstream only |
 | `pr/mqtt-api-publish-way` | upstream only |
 | `pr/mqtt-events-free` | upstream only |
@@ -108,6 +108,6 @@ Each `pr/` branch holds one part of this topic on top of upstream and says in it
 | `pr/network-tasks-loop-core` | `pr/esp32-loop-task-core` of p1ngb4ck/esphome-esp32-platform |
 | `pr/network-usb-ethernet` | `pr/network-restore-default-dns` |
 | `pr/network-wifi-idf61` | upstream only |
-| `pr/wifi-ap-state-callback` | upstream only |
+| `pr/wifi-ap-state-callback` | `pr/wifi-startup-done-callback` |
 | `pr/wifi-saved-networks` | upstream only |
 | `pr/wifi-startup-done-callback` | upstream only |
