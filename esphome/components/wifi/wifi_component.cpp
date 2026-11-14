@@ -1254,9 +1254,6 @@ void WiFiComponent::set_ap(const WiFiAP &ap) {
 }
 #endif  // USE_WIFI_AP
 
-#ifdef USE_WIFI_SAVED_NETWORKS
-void WiFiComponent::init_sta(size_t count) { this->sta_.init(count); }
-#endif
 void WiFiComponent::add_sta(const WiFiAP &ap) { this->sta_.push_back(ap); }
 void WiFiComponent::clear_sta() {
   // Clear roaming state - no more configured networks
@@ -1269,9 +1266,6 @@ void WiFiComponent::clear_sta() {
 }
 void WiFiComponent::set_sta(const WiFiAP &ap) {
   this->clear_sta();  // Also clears roaming state
-#ifdef USE_WIFI_SAVED_NETWORKS
-  this->init_sta(1);
-#endif
   this->add_sta(ap);
   this->selected_sta_index_ = 0;
   // New credentials end the next cooldown early; start_connecting() clears this once they are tried

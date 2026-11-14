@@ -5,7 +5,6 @@
 #include "esphome/components/network/ip_address.h"
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
-#include "esphome/core/entity_list.h"
 #include "esphome/core/helpers.h"
 #ifdef USE_ESP32
 #include "esphome/core/lock_free_queue.h"
@@ -516,9 +515,6 @@ class WiFiComponent final : public Component {
   // Returns a copy of the currently selected AP configuration
   WiFiAP get_sta() const;
   // add_sta kept out of line: inlining it into the generated setup() grows flash
-#ifdef USE_WIFI_SAVED_NETWORKS
-  void init_sta(size_t count);
-#endif
   void add_sta(const WiFiAP &ap);
 #ifdef USE_WIFI_MANUAL_IP
   bool manual_ip_index_in_use(uint8_t index) const;
@@ -716,14 +712,12 @@ class WiFiComponent final : public Component {
   /** Add a listener for IP state changes.
    * Listener receives: IP addresses, DNS address 1, DNS address 2
    */
-  void add_ip_state_listener(WiFiIPStateListener *listener) {
-    this->add_listener_(this->ip_state_listeners_, listener);
-  }
+  void add_ip_state_listener(WiFiIPStateListener *listener) { this->ip_state_listeners_.push_back(listener); }
 #endif  // USE_WIFI_IP_STATE_LISTENERS
 #ifdef USE_WIFI_SCAN_RESULTS_LISTENERS
   /// Add a listener for WiFi scan results
   void add_scan_results_listener(WiFiScanResultsListener *listener) {
-    this->add_listener_(this->scan_results_listeners_, listener);
+    this->scan_results_listeners_.push_back(listener);
   }
 #endif  // USE_WIFI_SCAN_RESULTS_LISTENERS
   /// The WiFi start-up is done (main loop, once per boot): connected, or the first attempt ended without a
@@ -738,16 +732,14 @@ class WiFiComponent final : public Component {
    * Listener receives: SSID, BSSID
    */
   void add_connect_state_listener(WiFiConnectStateListener *listener) {
-    this->add_listener_(this->connect_state_listeners_, listener);
+    this->connect_state_listeners_.push_back(listener);
   }
 #endif  // USE_WIFI_CONNECT_STATE_LISTENERS
 #ifdef USE_WIFI_POWER_SAVE_LISTENERS
   /** Add a listener for WiFi power save mode changes.
    * Listener receives: WiFiPowerSaveMode
    */
-  void add_power_save_listener(WiFiPowerSaveListener *listener) {
-    this->add_listener_(this->power_save_listeners_, listener);
-  }
+  void add_power_save_listener(WiFiPowerSaveListener *listener) { this->power_save_listeners_.push_back(listener); }
 #endif  // USE_WIFI_POWER_SAVE_LISTENERS
 
 #ifdef USE_WIFI_RUNTIME_POWER_SAVE
@@ -1077,27 +1069,20 @@ class WiFiComponent final : public Component {
   std::vector<WiFiSTAPriority> sta_priorities_;
   // Guarded by ScanResultsLock (see below this class)
   wifi_scan_vector_t<WiFiScanResult> scan_result_;
-  template<typename L> static void remove_listener_(void *list, void *listener, void *unused) {
-    static_cast<L *>(list)->remove(static_cast<typename L::value_type>(listener));
-  }
-  template<typename L> void add_listener_(L &list, typename L::value_type listener) {
-    list.push_back(listener);
-    note_registration(&WiFiComponent::remove_listener_<L>, &list, listener, nullptr);
-  }
 #ifdef WIFI_SCAN_RESULTS_LOCK_ENABLED
   Mutex scan_result_lock_;
 #endif
 #ifdef USE_WIFI_IP_STATE_LISTENERS
-  EntityList<WiFiIPStateListener *, ESPHOME_WIFI_IP_STATE_LISTENERS> ip_state_listeners_;
+  StaticVector<WiFiIPStateListener *, ESPHOME_WIFI_IP_STATE_LISTENERS> ip_state_listeners_;
 #endif
 #ifdef USE_WIFI_SCAN_RESULTS_LISTENERS
-  EntityList<WiFiScanResultsListener *, ESPHOME_WIFI_SCAN_RESULTS_LISTENERS> scan_results_listeners_;
+  StaticVector<WiFiScanResultsListener *, ESPHOME_WIFI_SCAN_RESULTS_LISTENERS> scan_results_listeners_;
 #endif
 #ifdef USE_WIFI_CONNECT_STATE_LISTENERS
-  EntityList<WiFiConnectStateListener *, ESPHOME_WIFI_CONNECT_STATE_LISTENERS> connect_state_listeners_;
+  StaticVector<WiFiConnectStateListener *, ESPHOME_WIFI_CONNECT_STATE_LISTENERS> connect_state_listeners_;
 #endif
 #ifdef USE_WIFI_POWER_SAVE_LISTENERS
-  EntityList<WiFiPowerSaveListener *, ESPHOME_WIFI_POWER_SAVE_LISTENERS> power_save_listeners_;
+  StaticVector<WiFiPowerSaveListener *, ESPHOME_WIFI_POWER_SAVE_LISTENERS> power_save_listeners_;
 #endif
   ESPPreferenceObject pref_;
 #ifdef USE_WIFI_SAVED_NETWORKS
@@ -1342,11 +1327,7 @@ class WiFiComponent final : public Component {
 #endif
 #endif
   // Last, so the inline network slots do not push the other members past short load offsets
-#ifdef USE_WIFI_SAVED_NETWORKS
-  FixedVector<WiFiAP> sta_;
-#else
   StaticVector<WiFiAP, WIFI_NETWORK_COUNT> sta_;
-#endif
 
  private:
   // Stores a pointer to a string literal (static storage duration).

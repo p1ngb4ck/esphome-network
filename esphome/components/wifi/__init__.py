@@ -882,8 +882,6 @@ async def to_code(config):
     # set_sta() stores one network at run time even when none is configured
     cg.add_define("WIFI_NETWORK_COUNT", max(1, len(networks)))
     if networks:
-        if config.get(CONF_SAVED_NETWORKS) is not None:
-            cg.add(var.init_sta(len(networks)))
         if len(networks) > 1:
             # The ESP32 scan can filter one SSID in the driver; with several the whole list is kept
             cg.add_define("USE_WIFI_MULTI_SSID")
