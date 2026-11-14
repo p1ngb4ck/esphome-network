@@ -7,21 +7,12 @@ from typing import Any
 
 import voluptuous as vol
 
-from esphome import automation, external_files, pins
+from esphome import external_files
 import esphome.codegen as cg
 from esphome.components import esp32, network, update
 from esphome.components.const import CONF_SHA256
 import esphome.config_validation as cv
-from esphome.const import (
-    CONF_BAUD_RATE,
-    CONF_ID,
-    CONF_PATH,
-    CONF_RX_PIN,
-    CONF_SOURCE,
-    CONF_TX_PIN,
-    CONF_TYPE,
-    CONF_URL,
-)
+from esphome.const import CONF_ID, CONF_PATH, CONF_SOURCE, CONF_TYPE, CONF_URL
 from esphome.core import CORE, ID, HexInt
 from esphome.types import ConfigType
 
@@ -31,12 +22,6 @@ CODEOWNERS = ["@swoboda1337"]
 DEPENDENCIES = ["esp32_hosted"]
 
 CONF_HTTP_REQUEST_ID = "http_request_id"
-CONF_SERIAL = "serial"
-CONF_UART_NUM = "uart_num"
-CONF_BOOT_PIN = "boot_pin"
-CONF_ENABLED = "enabled"
-CONF_SAFE_MODE_ID = "safe_mode_id"
-CONF_ON_PROGRESS = "on_progress"
 
 TYPE_EMBEDDED = "embedded"
 TYPE_HTTP = "http"
@@ -48,8 +33,6 @@ def AUTO_LOAD(config: ConfigType) -> list[str]:
     the storage component, pulled in only when 'type: storage' is selected — other sources pay
     nothing for it."""
     base = ["sha256", "watchdog", "json"]
-    if config and CONF_SERIAL in config:
-        base = base + ["md5"]
     if config and config.get(CONF_TYPE) == TYPE_STORAGE:
         return base + ["storage"]
     return base
@@ -60,9 +43,6 @@ HttpRequestComponent = http_request_ns.class_("HttpRequestComponent", cg.Compone
 UpdateMethod = esp32_hosted_ns.enum("UpdateMethod", is_class=True)
 Esp32HostedUpdate = esp32_hosted_ns.class_(
     "Esp32HostedUpdate", update.UpdateEntity, cg.PollingComponent
-)
-SafeModeComponent = cg.esphome_ns.namespace("safe_mode").class_(
-    "SafeModeComponent", cg.Component
 )
 
 
@@ -77,29 +57,8 @@ def _validate_sha256(value: Any) -> str:
     return value
 
 
-SERIAL_SCHEMA = cv.Schema(
-    {
-        cv.Required(CONF_UART_NUM): cv.int_range(min=1, max=4),
-        cv.Required(CONF_TX_PIN): pins.internal_gpio_output_pin_number,
-        cv.Required(CONF_RX_PIN): pins.internal_gpio_input_pin_number,
-        cv.Required(CONF_BOOT_PIN): pins.internal_gpio_output_pin_number,
-        cv.Optional(CONF_BAUD_RATE, default=460800): cv.int_range(
-            min=115200, max=2000000
-        ),
-        cv.Optional(CONF_ENABLED, default=False): cv.boolean,
-    }
-)
-
-BASE_SCHEMA = (
-    update.update_schema(Esp32HostedUpdate, device_class="firmware")
-    .extend(cv.polling_component_schema("6h"))
-    .extend(
-        {
-            cv.Optional(CONF_SERIAL): SERIAL_SCHEMA,
-            cv.OnlyWith(CONF_SAFE_MODE_ID, "safe_mode"): cv.use_id(SafeModeComponent),
-            cv.Optional(CONF_ON_PROGRESS): automation.validate_automation({}),
-        }
-    )
+BASE_SCHEMA = update.update_schema(Esp32HostedUpdate, device_class="firmware").extend(
+    cv.polling_component_schema("6h")
 )
 
 EMBEDDED_SCHEMA = cv.All(
@@ -229,27 +188,6 @@ FINAL_VALIDATE_SCHEMA = _validate_firmware
 
 async def to_code(config: dict[str, Any]) -> None:
     var = await update.new_update(config)
-
-    if (serial := config.get(CONF_SERIAL)) is not None:
-        cg.add(
-            var.set_serial(
-                serial[CONF_UART_NUM],
-                serial[CONF_TX_PIN],
-                serial[CONF_RX_PIN],
-                serial[CONF_BOOT_PIN],
-                serial[CONF_BAUD_RATE],
-            )
-        )
-        cg.add(var.set_serial_default(serial[CONF_ENABLED]))
-        cg.add_define("USE_ESP32_HOSTED_SERIAL")
-    if CONF_SAFE_MODE_ID in config:
-        safe_mode = await cg.get_variable(config[CONF_SAFE_MODE_ID])
-        cg.add(var.set_safe_mode(safe_mode))
-        cg.add_define("USE_ESP32_HOSTED_UPDATE_SAFE_MODE")
-    for on_progress in config.get(CONF_ON_PROGRESS, []):
-        await automation.build_automation(
-            var.get_progress_trigger(), [(float, "x")], on_progress
-        )
 
     firmware_type = config[CONF_TYPE]
     if firmware_type == TYPE_EMBEDDED:
