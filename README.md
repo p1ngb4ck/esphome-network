@@ -86,3 +86,28 @@ core of the build host stays as installed.
 ## Thanks
 
 Everyone this project builds on: [ATTRIBUTIONS.md](https://github.com/p1ngb4ck/esphome/blob/dev/ATTRIBUTIONS.md).
+
+## Branch structure
+
+Each `pr/` branch holds one part of this topic on top of upstream and says in its `BRANCH.md` what it is based on. `main` holds all of them.
+
+| Branch | Based on |
+|---|---|
+| `pr/boot-announce` | `pr/network-priority` |
+| `pr/esp32-hosted-update-sources` | `pr/storage` of p1ngb4ck/esphome-storage-interface |
+| `pr/ethernet-runtime` | `pr/esp32-nvs-defaults` of p1ngb4ck/esphome-storage-drivers |
+| `pr/improv-serial-identity` | `pr/network-name-from-nvs` |
+| `pr/improv-serial-network` | upstream only |
+| `pr/mqtt-api-publish-way` | upstream only |
+| `pr/mqtt-events-free` | upstream only |
+| `pr/mqtt-tls-sha512` | `pr/esp32-cert-bundle-sha512` of p1ngb4ck/esphome-esp32-platform |
+| `pr/network-name-from-nvs` | `pr/network-priority` |
+| `pr/network-nvs-ready` | `pr/esp32-nvs-ready` of p1ngb4ck/esphome-storage-drivers |
+| `pr/network-priority` | upstream only |
+| `pr/network-restore-default-dns` | `pr/network-priority` |
+| `pr/network-tasks-loop-core` | `pr/esp32-loop-task-core` of p1ngb4ck/esphome-esp32-platform |
+| `pr/network-usb-ethernet` | `pr/network-restore-default-dns` |
+| `pr/network-wifi-idf61` | upstream only |
+| `pr/wifi-ap-state-callback` | upstream only |
+| `pr/wifi-saved-networks` | upstream only |
+| `pr/wifi-startup-done-callback` | upstream only |
