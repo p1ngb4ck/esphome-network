@@ -10,6 +10,7 @@ from esphome.components.esp32 import (
     add_idf_sdkconfig_option,
     const,
     get_esp32_variant,
+    idf_version,
     only_on_variant,
     request_wifi,
     require_idf_version,
@@ -62,6 +63,7 @@ from esphome.const import (
     CONF_STORAGE,
     CONF_SUBNET,
     CONF_TIMEOUT,
+    CONF_TRIGGER_ID,
     CONF_TTLS_PHASE_2,
     CONF_USE_ADDRESS,
     CONF_USERNAME,
@@ -163,12 +165,16 @@ CONF_BAND_MODE = "band_mode"
 CONF_DEVICE_INFO = "device_info"
 CONF_DPP = "dpp"
 CONF_MIN_AUTH_MODE = "min_auth_mode"
+CONF_ON_AP_START = "on_ap_start"
+CONF_ON_AP_STOP = "on_ap_stop"
 CONF_ON_DPP_URI = "on_dpp_uri"
 CONF_PHY_MODE = "phy_mode"
 CONF_POST_CONNECT_ROAMING = "post_connect_roaming"
 CONF_PRIVATE_KEY = "private_key"
 CONF_AP_MODE = "ap_mode"
 CONF_DNS_SERVERS = "dns_servers"
+CONF_SAVED_NETWORKS = "saved_networks"
+CONF_ON_SCAN_RESULTS = "on_scan_results"
 
 # Maximum number of WiFi networks that can be configured
 # Limited to 127 because selected_sta_index_ is int8_t in C++
@@ -239,6 +245,9 @@ def _validate_dns_servers(value: list) -> list:
     return value
 
 
+ScanResultsTrigger = wifi_ns.class_(
+    "ScanResultsTrigger", automation.Trigger.template(), cg.Component
+)
 WiFiConfigureAction = wifi_ns.class_(
     "WiFiConfigureAction", automation.Action, cg.Component
 )
@@ -755,16 +764,28 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_PASSIVE_SCAN, default=False): cv.boolean,
             cv.Optional(CONF_ENABLE_ON_BOOT, default=True): cv.boolean,
             cv.Optional(CONF_POST_CONNECT_ROAMING, default=True): cv.boolean,
+            cv.Optional(CONF_ON_AP_START): automation.validate_automation(single=True),
+            cv.Optional(CONF_ON_AP_STOP): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_CONNECT): automation.validate_automation(single=True),
             cv.Optional(CONF_ON_DISCONNECT): automation.validate_automation(
                 single=True
             ),
             cv.Optional(CONF_ON_DPP_URI): automation.validate_automation(single=True),
+            # Networks changed at runtime (put_network() ...), saved: up to this many
+            cv.Optional(CONF_SAVED_NETWORKS): cv.All(
+                cv.int_range(min=1, max=16), cv.only_on_esp32
+            ),
+            cv.Optional(CONF_ON_SCAN_RESULTS): automation.validate_automation(
+                {
+                    cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(ScanResultsTrigger),
+                }
+            ),
             cv.Optional(CONF_USE_PSRAM): cv.All(
                 cv.only_on_esp32, cv.requires_component("psram"), cv.boolean
             ),
         }
     ),
+    cv.key_requires((CONF_ON_AP_START, CONF_ON_AP_STOP), CONF_AP),
     cv.key_requires(CONF_ON_DPP_URI, CONF_DPP),
     cv.key_requires(CONF_PASSWORD, CONF_SSID),
     cv.key_requires(
@@ -861,6 +882,8 @@ async def to_code(config):
     # set_sta() stores one network at run time even when none is configured
     cg.add_define("WIFI_NETWORK_COUNT", max(1, len(networks)))
     if networks:
+        if config.get(CONF_SAVED_NETWORKS) is not None:
+            cg.add(var.init_sta(len(networks)))
         if len(networks) > 1:
             # The ESP32 scan can filter one SSID in the driver; with several the whole list is kept
             cg.add_define("USE_WIFI_MULTI_SSID")
@@ -928,7 +951,7 @@ async def to_code(config):
         cg.add_define("USE_WIFI_DPP")
 
     # Disable Enterprise WiFi support if no EAP is configured
-    if CORE.is_esp32:
+    if CORE.is_esp32 and not idf_version() >= cv.Version(6, 1, 0):
         add_idf_sdkconfig_option("CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT", has_eap)
         if has_eap:
             # The supplicant's Kconfig select cannot override the IDF 5 TLS
@@ -937,13 +960,20 @@ async def to_code(config):
             require_mbedtls_tls()
             require_mbedtls_tls_extras()
 
+    if (saved_networks := config.get(CONF_SAVED_NETWORKS)) is not None:
+        cg.add_define("USE_WIFI_SAVED_NETWORKS")
+        cg.add_define("WIFI_SAVED_NETWORKS_MAX", saved_networks)
+        # Several networks and a manual address each, at runtime; the networks around stay for the list
+        cg.add_define("USE_WIFI_MULTI_SSID")
+        request_wifi_scan_results()
+
     # Only define USE_WIFI_MANUAL_IP if any AP uses manual IP
-    if manual_ip_entries:
+    if manual_ip_entries or saved_networks is not None:
         cg.add_define("USE_WIFI_MANUAL_IP")
         cg.extern_progmem_array(
             "esphome::wifi::MANUAL_IP_TABLE",
             cg.uint8,
-            list(b"".join(manual_ip_entries)),
+            list(b"".join(manual_ip_entries)) or [0] * 20,
         )
 
     # The C++ initializers are DEFAULT_REBOOT_TIMEOUT, power save NONE and minimum
@@ -1049,38 +1079,42 @@ async def to_code(config):
             # Higher maximum values are allowed because CONFIG_LWIP_WND_SCALE may be set to true in networking component
             # Based on https://github.com/espressif/esp-adf/issues/297#issuecomment-783811702
 
-            # Large dynamic RX buffers (requires PSRAM)
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM", 16)
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM", 512)
+            # CONFIG OPTIONS removed with esp-idf > 6.1.0
+            if not idf_version() >= cv.Version(6, 1, 0):
+                # Large dynamic RX buffers (requires PSRAM)
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM", 16)
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM", 512)
 
-            # Static TX buffers for better performance
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_STATIC_TX_BUFFER", True)
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_TX_BUFFER_TYPE", 0)
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM", 32)
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM", 8)
+                # Static TX buffers for better performance
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_STATIC_TX_BUFFER", True)
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_TX_BUFFER_TYPE", 0)
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_CACHE_TX_BUFFER_NUM", 32)
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_STATIC_TX_BUFFER_NUM", 8)
 
-            # AMPDU settings optimized for PSRAM
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_AMPDU_TX_ENABLED", True)
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_TX_BA_WIN", 16)
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_AMPDU_RX_ENABLED", True)
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_RX_BA_WIN", 32)
+                # AMPDU settings optimized for PSRAM
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_AMPDU_TX_ENABLED", True)
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_TX_BA_WIN", 16)
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_AMPDU_RX_ENABLED", True)
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_RX_BA_WIN", 32)
         else:
             _LOGGER.info(
                 "Applying optimized WiFi settings: 64 RX buffers, 64 TX buffers"
             )
-            # PSRAM not guaranteed - use more conservative, but still optimized settings
-            # Based on https://github.com/espressif/esp-idf/blob/release/v5.4/examples/wifi/iperf/sdkconfig.defaults.esp32
+            
+            if not idf_version() >= cv.Version(6, 1, 0):
+                # PSRAM not guaranteed - use more conservative, but still optimized settings
+                # Based on https://github.com/espressif/esp-idf/blob/release/v5.4/examples/wifi/iperf/sdkconfig.defaults.esp32
+                
+                # Standard buffer counts
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM", 16)
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM", 64)
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM", 64)
 
-            # Standard buffer counts
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM", 16)
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM", 64)
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM", 64)
-
-            # Standard AMPDU settings
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_AMPDU_TX_ENABLED", True)
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_TX_BA_WIN", 32)
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_AMPDU_RX_ENABLED", True)
-            add_idf_sdkconfig_option("CONFIG_ESP_WIFI_RX_BA_WIN", 32)
+                # Standard AMPDU settings
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_AMPDU_TX_ENABLED", True)
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_TX_BA_WIN", 32)
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_AMPDU_RX_ENABLED", True)
+                add_idf_sdkconfig_option("CONFIG_ESP_WIFI_RX_BA_WIN", 32)
 
     cg.add_define("USE_WIFI")
 
@@ -1088,6 +1122,14 @@ async def to_code(config):
     await cg.register_component(var, config)
 
     await cg.past_safe_mode()
+
+    for conf_key, define, setter in (
+        (CONF_ON_AP_START, "USE_WIFI_AP_START_TRIGGER", var.set_on_ap_start),
+        (CONF_ON_AP_STOP, "USE_WIFI_AP_STOP_TRIGGER", var.set_on_ap_stop),
+    ):
+        if (conf := config.get(conf_key)) is not None:
+            cg.add_define(define)
+            cg.add(setter(await automation.build_trigger_callback([], conf, params=[])))
 
     if on_connect_config := config.get(CONF_ON_CONNECT):
         cg.add_define("USE_WIFI_CONNECT_TRIGGER")
@@ -1100,6 +1142,16 @@ async def to_code(config):
         await automation.build_automation(
             var.get_disconnect_trigger(), [], on_disconnect_config
         )
+
+    if on_scan_results := config.get(CONF_ON_SCAN_RESULTS):
+        cg.add_define("USE_WIFI_SCAN_RESULTS_TRIGGER")
+        request_wifi_scan_results()
+        for conf in on_scan_results:
+            trigger = cg.new_Pvariable(conf[CONF_TRIGGER_ID])
+            await cg.register_component(trigger, conf)
+            request_wifi_scan_results_listener()
+            cg.add(var.add_scan_results_listener(trigger))
+            await automation.build_automation(trigger, [], conf)
 
     if (on_dpp_uri := config.get(CONF_ON_DPP_URI)) is not None:
         cg.add_define("USE_WIFI_DPP_URI_TRIGGER")

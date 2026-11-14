@@ -1,4 +1,5 @@
 #include "wifi_component.h"
+#include "esphome/components/network/util.h"
 #ifdef USE_WIFI
 #include <cassert>
 #include <cinttypes>
@@ -697,6 +698,19 @@ void WiFiComponent::setup() {
   }
 #endif
 
+#ifdef USE_WIFI_SAVED_NETWORKS
+  // Fixed keys, not the configuration hash: the list outlives firmware updates
+  const uint32_t saved_hash = fnv1_hash("wifi_networks");
+  this->saved_header_pref_ = global_preferences->make_preference<SavedWifiNetworksHeader>(saved_hash, true);
+  for (size_t i = 0; i < WIFI_SAVED_NETWORKS_MAX; i++) {
+    this->saved_network_prefs_[i] =
+        global_preferences->make_preference<SavedWifiNetwork>(saved_hash + 1 + static_cast<uint32_t>(i), true);
+  }
+  SavedWifiNetworksHeader header{};
+  if (this->saved_header_pref_.load(&header) && header.version == SAVED_WIFI_NETWORKS_VERSION)
+    this->enable_on_boot_ = !(header.flags & SAVED_WIFI_NETWORKS_DISABLED);
+#endif
+
   if (this->enable_on_boot_) {
 #ifdef USE_ESP32
     this->wifi_lazy_init_();
@@ -705,6 +719,15 @@ void WiFiComponent::setup() {
   } else {
     this->state_ = WIFI_COMPONENT_STATE_DISABLED;
     this->finish_startup_();  // disabled at boot: nothing to wait for
+  }
+}
+
+void WiFiComponent::apply_radio_settings_() {
+  if (!std::isnan(this->output_power_) && !this->wifi_apply_output_power_(this->output_power_)) {
+    ESP_LOGV(TAG, "Setting Output Power Option failed");
+  }
+  if (!this->wifi_apply_power_save_()) {
+    ESP_LOGV(TAG, "Setting Power Save Option failed");
   }
 }
 
@@ -744,6 +767,9 @@ void WiFiComponent::start() {
     sta.set_password(save.password);
     this->set_sta(sta);
   }
+#ifdef USE_WIFI_SAVED_NETWORKS
+  this->load_saved_networks_();
+#endif
 #ifdef USE_WIFI_LEASE_CACHE
   // After the saved credentials: set_sta() clears the cache, and the lease belongs to that same network
   this->load_lease_settings_();
@@ -751,10 +777,6 @@ void WiFiComponent::start() {
 
   if (this->has_sta()) {
     this->wifi_sta_pre_setup_();
-    if (!std::isnan(this->output_power_) && !this->wifi_apply_output_power_(this->output_power_)) {
-      ESP_LOGV(TAG, "Setting Output Power Option failed");
-    }
-
 #if defined(USE_ESP32) && defined(USE_WIFI_RUNTIME_POWER_SAVE)
     // Synchronize power_save_ with semaphore state before applying
     if (this->high_performance_semaphore_ != nullptr) {
@@ -768,9 +790,7 @@ void WiFiComponent::start() {
       }
     }
 #endif
-    if (!this->wifi_apply_power_save_()) {
-      ESP_LOGV(TAG, "Setting Power Save Option failed");
-    }
+    this->apply_radio_settings_();
 
     this->transition_to_phase_(WiFiRetryPhase::INITIAL_CONNECT);
 #ifdef USE_WIFI_FAST_CONNECT
@@ -807,6 +827,11 @@ void WiFiComponent::start() {
   if (!this->has_sta() && this->is_dpp_active_() && this->wifi_mode_(true, {}))
     this->start_dpp_listen_(millis());
 #endif
+#ifdef USE_RTL87XX
+  // Realtek starts lwIP on the first mode change; web_server's listener blocks forever until then
+  if (!this->has_sta() && !this->has_ap())
+    this->wifi_mode_(true, {});
+#endif
 #ifdef USE_IMPROV_BLE
   if (!this->has_sta() && improv_ble::global_improv_component != nullptr) {
     if (this->wifi_mode_(true, {}))
@@ -838,6 +863,22 @@ void WiFiComponent::loop() {
   if (events_processed || !this->connected_) {
     this->update_connected_state_();
   }
+
+#if defined(USE_WIFI_AP_START_TRIGGER) || defined(USE_WIFI_AP_STOP_TRIGGER)
+  // ap_setup_ is set only once the AP is fully up; firing from loop() keeps actions from
+  // re-entering setup_ap_config_()
+  if (const bool ap_up = this->ap_setup_; ap_up != this->handled_ap_state_) {
+    this->handled_ap_state_ = ap_up;
+#ifdef USE_WIFI_AP_START_TRIGGER
+    if (ap_up)
+      this->on_ap_start_();
+#endif
+#ifdef USE_WIFI_AP_STOP_TRIGGER
+    if (!ap_up)
+      this->on_ap_stop_();
+#endif
+  }
+#endif  // USE_WIFI_AP_START_TRIGGER || USE_WIFI_AP_STOP_TRIGGER
 
   if (this->has_sta()) {
 #if defined(USE_WIFI_CONNECT_TRIGGER) || defined(USE_WIFI_DISCONNECT_TRIGGER)
@@ -911,7 +952,16 @@ void WiFiComponent::loop() {
           // Post-connect roaming: check for better AP. A scan may have been started by an
           // explicit force_roam_check() even when post_connect_roaming_ is disabled, so the
           // scan must always be consumed here to avoid leaving roaming_state_ stuck.
-          if (this->is_roaming_scan_active()) {
+#ifdef USE_WIFI_SAVED_NETWORKS
+          // A browse scan's results stay for their reader (keep_scan_results); nothing connects from them
+          if (this->browse_scan_) {
+            if (this->scan_done_ || now - this->browse_started_ > WIFI_SCAN_TIMEOUT_MS) {
+              this->scan_done_ = false;
+              this->browse_scan_ = false;
+            }
+          } else
+#endif
+              if (this->is_roaming_scan_active()) {
             if (this->scan_done_) {
               this->process_roaming_scan_();
             }
@@ -1106,7 +1156,7 @@ void WiFiComponent::setup_ap_config_() {
     // Build AP SSID from app name without heap allocation; WiFi SSID max is 32 bytes
     static constexpr size_t AP_SSID_MAX_LEN = 32;
 
-    const auto &app_name = App.get_name();
+    const StringRef app_name = network::device_name();
     if (app_name.length() <= AP_SSID_MAX_LEN) {
       // Name fits, use directly
       this->ap_.set_ssid(app_name.c_str());
@@ -1122,11 +1172,10 @@ void WiFiComponent::setup_ap_config_() {
   this->ap_setup_ = this->wifi_start_ap_(this->ap_);
   if (this->ap_setup_)
     this->ap_state_callback_.call(true);
-  // The station path applied it in start(); without a station the radio only exists from here
-  if (this->ap_setup_ && !this->has_sta() && !std::isnan(this->output_power_) &&
-      !this->wifi_apply_output_power_(this->output_power_)) {
-    ESP_LOGV(TAG, "Setting Output Power Option failed");
-  }
+  // The station path applied these in start(); without a station the radio only exists from here,
+  // and credentials saved through the portal connect without another start()
+  if (this->ap_setup_ && !this->has_sta())
+    this->apply_radio_settings_();
 #if defined(USE_WIFI_AP_EXCLUSIVE) || defined(USE_WIFI_AP_PERSISTENT)
   // A failed start must not leave the radio in AP mode: on an exclusive radio it would refuse
   // the STA attempts until the next try, and an AP that stays up would take clients it cannot serve.
@@ -1205,6 +1254,9 @@ void WiFiComponent::set_ap(const WiFiAP &ap) {
 }
 #endif  // USE_WIFI_AP
 
+#ifdef USE_WIFI_SAVED_NETWORKS
+void WiFiComponent::init_sta(size_t count) { this->sta_.init(count); }
+#endif
 void WiFiComponent::add_sta(const WiFiAP &ap) { this->sta_.push_back(ap); }
 void WiFiComponent::clear_sta() {
   // Clear roaming state - no more configured networks
@@ -1217,6 +1269,9 @@ void WiFiComponent::clear_sta() {
 }
 void WiFiComponent::set_sta(const WiFiAP &ap) {
   this->clear_sta();  // Also clears roaming state
+#ifdef USE_WIFI_SAVED_NETWORKS
+  this->init_sta(1);
+#endif
   this->add_sta(ap);
   this->selected_sta_index_ = 0;
   // New credentials end the next cooldown early; start_connecting() clears this once they are tried
@@ -1274,6 +1329,276 @@ WiFiAP WiFiComponent::get_sta() const {
   const WiFiAP *config = this->get_selected_sta_();
   return config ? *config : WiFiAP{};
 }
+#ifdef USE_WIFI_SAVED_NETWORKS
+static uint32_t ip4_value(const network::IPAddress &ip) {
+  esp_ip4_addr_t value = ip;
+  return value.addr;
+}
+
+static network::IPAddress ip4_address(uint32_t value) {
+  esp_ip4_addr_t ip{.addr = value};
+  return network::IPAddress(&ip);
+}
+
+static bool is_eap_network(const WiFiAP &ap) {
+#ifdef USE_WIFI_WPA2_EAP
+  return ap.get_eap().has_value();
+#else
+  return false;
+#endif
+}
+
+/// The network with the same SSID replaced (moved first when asked), else added; false when full or not storable.
+static bool merge_network(std::vector<WiFiAP> &networks, const WiFiAP &ap, bool first) {
+  if (ap.get_ssid().empty() || ap.get_ssid().size() > 32 || ap.get_password().size() > 64)
+    return false;
+  auto it = std::find_if(networks.begin(), networks.end(),
+                         [&ap](const WiFiAP &other) { return other.get_ssid() == ap.get_ssid(); });
+  if (it != networks.end()) {
+    if (first) {
+      networks.erase(it);
+      networks.insert(networks.begin(), ap);
+    } else {
+      *it = ap;
+    }
+    return true;
+  }
+  if (networks.size() >= WIFI_SAVED_NETWORKS_MAX)
+    return false;
+  if (first) {
+    networks.insert(networks.begin(), ap);
+  } else {
+    networks.push_back(ap);
+  }
+  return true;
+}
+
+static bool same_network_settings(const WiFiAP &a, const WiFiAP &b) {
+  if (a.get_ssid() != b.get_ssid() || a.get_password() != b.get_password() || a.get_hidden() != b.get_hidden())
+    return false;
+  const auto &ip_a = a.get_manual_ip();
+  const auto &ip_b = b.get_manual_ip();
+  if (ip_a.has_value() != ip_b.has_value())
+    return false;
+  return !ip_a.has_value() || (ip_a->static_ip == ip_b->static_ip && ip_a->gateway == ip_b->gateway &&
+                               ip_a->subnet == ip_b->subnet && ip_a->dns1 == ip_b->dns1 && ip_a->dns2 == ip_b->dns2);
+}
+
+/// The index into the saveable networks of sta[index]; -1 for an EAP network or out of range.
+static int saveable_index(const FixedVector<WiFiAP> &sta, size_t index) {
+  if (index >= sta.size() || is_eap_network(sta[index]))
+    return -1;
+  int saveable = 0;
+  for (size_t i = 0; i < index; i++) {
+    if (!is_eap_network(sta[i]))
+      saveable++;
+  }
+  return saveable;
+}
+
+std::vector<WiFiAP> WiFiComponent::saveable_networks_() const {
+  std::vector<WiFiAP> networks;
+  for (const auto &ap : this->sta_) {
+    if (!is_eap_network(ap))
+      networks.push_back(ap);
+  }
+  return networks;
+}
+
+void WiFiComponent::load_saved_networks_() {
+  SavedWifiNetworksHeader header{};
+  if (!this->saved_header_pref_.load(&header) || header.version != SAVED_WIFI_NETWORKS_VERSION)
+    return;
+  std::vector<WiFiAP> networks;
+  const size_t count = std::min<size_t>(header.count, WIFI_SAVED_NETWORKS_MAX);
+  for (size_t i = 0; i < count; i++) {
+    SavedWifiNetwork saved{};
+    if (!this->saved_network_prefs_[i].load(&saved))
+      continue;
+    saved.ssid[sizeof(saved.ssid) - 1] = '\0';
+    saved.password[sizeof(saved.password) - 1] = '\0';
+    WiFiAP ap;
+    ap.set_ssid(saved.ssid);
+    ap.set_password(saved.password);
+    ap.set_hidden(saved.flags & SAVED_WIFI_NETWORK_HIDDEN);
+    bssid_t bssid;
+    std::copy(saved.bssid, saved.bssid + 6, bssid.begin());
+    ap.set_bssid(bssid);
+    if (saved.channel != 0)
+      ap.set_channel(saved.channel);
+    if (saved.flags & SAVED_WIFI_NETWORK_MANUAL_IP) {
+      ManualIP manual_ip{};
+      manual_ip.static_ip = ip4_address(saved.static_ip);
+      manual_ip.gateway = ip4_address(saved.gateway);
+      manual_ip.subnet = ip4_address(saved.subnet);
+      manual_ip.dns1 = ip4_address(saved.dns1);
+      manual_ip.dns2 = ip4_address(saved.dns2);
+      ap.set_manual_ip(manual_ip);
+    }
+    networks.push_back(ap);
+  }
+  this->use_networks_(networks);
+  ESP_LOGD(TAG, "Saved networks: %zu", networks.size());
+}
+
+bool WiFiComponent::store_networks_(const std::vector<WiFiAP> &networks, bool disabled) {
+  if (networks.size() > WIFI_SAVED_NETWORKS_MAX)
+    return false;
+  for (size_t i = 0; i < networks.size(); i++) {
+    const WiFiAP &ap = networks[i];
+    SavedWifiNetwork saved{};
+    // An empty StringRef has no characters to copy (c_str() is null)
+    if (!ap.get_ssid().empty())
+      strncpy(saved.ssid, ap.get_ssid().c_str(), sizeof(saved.ssid) - 1);
+    if (!ap.get_password().empty())
+      strncpy(saved.password, ap.get_password().c_str(), sizeof(saved.password) - 1);
+    std::copy(ap.get_bssid().begin(), ap.get_bssid().end(), saved.bssid);
+    saved.channel = ap.get_channel();
+    if (ap.get_hidden())
+      saved.flags |= SAVED_WIFI_NETWORK_HIDDEN;
+    if (const optional<ManualIP> manual = ap.get_manual_ip(); manual.has_value()) {
+      const ManualIP &manual_ip = *manual;
+      saved.flags |= SAVED_WIFI_NETWORK_MANUAL_IP;
+      saved.static_ip = ip4_value(manual_ip.static_ip);
+      saved.gateway = ip4_value(manual_ip.gateway);
+      saved.subnet = ip4_value(manual_ip.subnet);
+      saved.dns1 = ip4_value(manual_ip.dns1);
+      saved.dns2 = ip4_value(manual_ip.dns2);
+    }
+    this->saved_network_prefs_[i].save(&saved);
+  }
+  SavedWifiNetworksHeader header{};
+  header.version = SAVED_WIFI_NETWORKS_VERSION;
+  header.count = static_cast<uint8_t>(networks.size());
+  header.flags = disabled ? SAVED_WIFI_NETWORKS_DISABLED : 0;
+  this->saved_header_pref_.save(&header);
+  global_preferences->sync();
+  return true;
+}
+
+void WiFiComponent::use_networks_(const std::vector<WiFiAP> &networks) {
+  // The configuration's EAP networks are not saved: they stay, after the list
+  std::vector<WiFiAP> all(networks);
+  for (const auto &ap : this->sta_) {
+    if (is_eap_network(ap))
+      all.push_back(ap);
+  }
+  this->clear_sta();
+  this->init_sta(all.size());
+  for (size_t i = 0; i < all.size(); i++) {
+    WiFiAP ap = all[i];
+    // The order is the priority
+    ap.set_priority(static_cast<int8_t>(std::min<size_t>(all.size() - i, 127)));
+    this->add_sta(ap);
+  }
+  this->clear_all_bssid_priorities_();
+#ifdef USE_WIFI_LEASE_CACHE
+  // Its index may name another network now (a no-op in start(): the lease is loaded after)
+  this->clear_lease_settings_();
+#endif
+  if (!this->sta_.empty())
+    this->selected_sta_index_ = 0;
+}
+
+bool WiFiComponent::change_networks_(const std::vector<WiFiAP> &networks) {
+  if (!this->store_networks_(networks, !this->enable_on_boot_))
+    return false;
+  if (this->is_disabled()) {
+    this->use_networks_(networks);
+    return true;
+  }
+  // Connected to a network that stays as it was: keep the connection
+  const WiFiAP *selected = this->get_selected_sta_();
+  if (this->is_connected() && selected != nullptr) {
+    for (size_t i = 0; i < networks.size(); i++) {
+      if (same_network_settings(networks[i], *selected)) {
+        this->use_networks_(networks);
+        this->selected_sta_index_ = static_cast<int8_t>(i);
+        return true;
+      }
+    }
+  }
+  // Otherwise a new start with the new list (start() loads it)
+  this->disable();
+  this->enable();
+  return true;
+}
+
+bool WiFiComponent::put_network(const WiFiAP &ap, bool first) {
+  std::vector<WiFiAP> networks = this->saveable_networks_();
+  if (!merge_network(networks, ap, first))
+    return false;
+  return this->change_networks_(networks);
+}
+
+bool WiFiComponent::replace_network(size_t index, const WiFiAP &ap) {
+  const int at = saveable_index(this->sta_, index);
+  if (at < 0 || ap.get_ssid().empty() || ap.get_ssid().size() > 32 || ap.get_password().size() > 64)
+    return false;
+  std::vector<WiFiAP> networks = this->saveable_networks_();
+  networks[at] = ap;
+  // Another entry with the same SSID goes
+  for (int i = static_cast<int>(networks.size()) - 1; i >= 0; i--) {
+    if (i != at && networks[i].get_ssid() == ap.get_ssid())
+      networks.erase(networks.begin() + i);
+  }
+  return this->change_networks_(networks);
+}
+
+bool WiFiComponent::forget_network(size_t index) {
+  const int at = saveable_index(this->sta_, index);
+  if (at < 0)
+    return false;
+  std::vector<WiFiAP> networks = this->saveable_networks_();
+  networks.erase(networks.begin() + at);
+  return this->change_networks_(networks);
+}
+
+bool WiFiComponent::move_network(size_t index, int delta) {
+  const int at = saveable_index(this->sta_, index);
+  if (at < 0 || delta == 0)
+    return false;
+  std::vector<WiFiAP> networks = this->saveable_networks_();
+  const int to = at + delta;
+  if (to < 0 || to >= static_cast<int>(networks.size()))
+    return false;
+  std::swap(networks[at], networks[to]);
+  return this->change_networks_(networks);
+}
+
+bool WiFiComponent::browse_scan() {
+  if (this->state_ != WIFI_COMPONENT_STATE_STA_CONNECTED || this->browse_scan_ ||
+      this->roaming_state_ != RoamingState::IDLE)
+    return false;
+  // Set first: wifi_scan_start_() makes it a background scan that keeps the connection
+  this->browse_scan_ = true;
+  this->browse_started_ = millis();
+  if (!this->wifi_scan_start_(this->passive_scan_)) {
+    this->browse_scan_ = false;
+    return false;
+  }
+  return true;
+}
+
+void WiFiComponent::set_enabled(bool enabled) {
+  this->enable_on_boot_ = enabled;
+  if (enabled) {
+    this->enable();
+  } else {
+    this->disable();
+  }
+  SavedWifiNetworksHeader header{};
+  if (this->saved_header_pref_.load(&header) && header.version == SAVED_WIFI_NETWORKS_VERSION) {
+    header.flags = enabled ? 0 : SAVED_WIFI_NETWORKS_DISABLED;
+    this->saved_header_pref_.save(&header);
+    global_preferences->sync();
+  } else {
+    // No list saved yet: the networks as they are become it, with the setting
+    this->store_networks_(this->saveable_networks_(), !enabled);
+  }
+}
+#endif  // USE_WIFI_SAVED_NETWORKS
+
 void WiFiComponent::save_wifi_sta(const std::string &ssid, const std::string &password) {
   this->save_wifi_sta(ssid.c_str(), password.c_str());
 }
@@ -1290,7 +1615,18 @@ void WiFiComponent::save_wifi_sta(const char *ssid, const char *password) {
   sta.set_password(password);
   // No retry here: a captive portal save runs in lwIP's context on the ESP8266, where retry_connect() yields and
   // panics. set_sta() flags the credentials and loop() tries them
+#ifdef USE_WIFI_SAVED_NETWORKS
+  // Into the saved list, first: the network asked for now
+  std::vector<WiFiAP> networks = this->saveable_networks_();
+  if (merge_network(networks, sta, true) && this->store_networks_(networks, !this->enable_on_boot_)) {
+    this->use_networks_(networks);
+    this->skip_cooldown_next_cycle_ = true;
+  } else {
+    this->set_sta(sta);
+  }
+#else
   this->set_sta(sta);
+#endif
 #ifdef USE_WIFI_AP_EXCLUSIVE
   // The AP pauses for the new credentials once its answer is out, and the STA state machine picks them up
   if (this->ap_setup_) {
@@ -1486,7 +1822,7 @@ void WiFiComponent::print_connect_params_() {
                 "  Gateway: %s\n"
                 "  DNS1: %s\n"
                 "  DNS2: %s",
-                wifi_ssid_to(ssid_buf), bssid_s, App.get_name().c_str(), rssi, LOG_STR_ARG(get_signal_bars(rssi)),
+                wifi_ssid_to(ssid_buf), bssid_s, network::device_name().c_str(), rssi, LOG_STR_ARG(get_signal_bars(rssi)),
                 get_wifi_channel(), wifi_subnet_mask_().str_to(subnet_buf), wifi_gateway_ip_().str_to(gateway_buf),
                 wifi_dns_ip_(0).str_to(dns1_buf), wifi_dns_ip_(1).str_to(dns2_buf));
   // clang-format on
@@ -1543,6 +1879,9 @@ void WiFiComponent::disable() {
 }
 
 void WiFiComponent::start_scanning() {
+#ifdef USE_WIFI_SAVED_NETWORKS
+  this->browse_scan_ = false;
+#endif
   this->action_started_ = millis();
   ESP_LOGD(TAG, "Starting scan");
   this->wifi_scan_start_(this->passive_scan_);
@@ -2893,10 +3232,65 @@ void WiFiComponent::process_roaming_scan_() {
 optional<ManualIP> WiFiAP::get_manual_ip() const {
   if (!this->has_manual_ip())
     return {};
+  if (this->manual_ip_index_ >= MANUAL_IP_RUNTIME) {
+    const ManualIP *row = manual_ip_runtime_entry(this->manual_ip_index_);
+    if (row == nullptr)
+      return {};
+    return *row;
+  }
   uint8_t b[MANUAL_IP_ENTRY_SIZE];
   progmem_memcpy(b, MANUAL_IP_TABLE + this->manual_ip_index_ * MANUAL_IP_ENTRY_SIZE, sizeof(b));
   auto ip = [&b](size_t i) { return network::IPAddress(b[i], b[i + 1], b[i + 2], b[i + 3]); };
   return ManualIP{ip(0), ip(4), ip(8), ip(12), ip(16)};
+}
+
+static ManualIP *manual_ip_runtime_table = nullptr;
+static uint8_t manual_ip_runtime_used = 0;
+
+uint8_t manual_ip_runtime_row(const ManualIP &manual_ip) {
+  if (manual_ip_runtime_table == nullptr) {
+    manual_ip_runtime_table = RAMAllocator<ManualIP>().allocate(MANUAL_IP_RUNTIME_ROWS);
+    if (manual_ip_runtime_table == nullptr)
+      return MANUAL_IP_NONE;
+  }
+  auto same = [&manual_ip](const ManualIP &row) {
+    return row.static_ip == manual_ip.static_ip && row.gateway == manual_ip.gateway && row.subnet == manual_ip.subnet &&
+           row.dns1 == manual_ip.dns1 && row.dns2 == manual_ip.dns2;
+  };
+  for (uint8_t r = 0; r < manual_ip_runtime_used; r++) {
+    if (same(manual_ip_runtime_table[r]))
+      return MANUAL_IP_RUNTIME + r;
+  }
+  uint8_t row = manual_ip_runtime_used;
+  if (row >= MANUAL_IP_RUNTIME_ROWS) {
+    row = MANUAL_IP_RUNTIME_ROWS;
+    for (uint8_t r = 0; r < MANUAL_IP_RUNTIME_ROWS && row == MANUAL_IP_RUNTIME_ROWS; r++) {
+      if (global_wifi_component != nullptr && !global_wifi_component->manual_ip_index_in_use(MANUAL_IP_RUNTIME + r))
+        row = r;
+    }
+    if (row == MANUAL_IP_RUNTIME_ROWS)
+      return MANUAL_IP_NONE;
+  } else {
+    manual_ip_runtime_used++;
+  }
+  new (&manual_ip_runtime_table[row]) ManualIP(manual_ip);
+  return MANUAL_IP_RUNTIME + row;
+}
+
+const ManualIP *manual_ip_runtime_entry(uint8_t index) {
+  if (manual_ip_runtime_table == nullptr || index < MANUAL_IP_RUNTIME || index - MANUAL_IP_RUNTIME >= manual_ip_runtime_used)
+    return nullptr;
+  return &manual_ip_runtime_table[index - MANUAL_IP_RUNTIME];
+}
+
+bool WiFiComponent::manual_ip_index_in_use(uint8_t index) const {
+  if (this->ap_.get_manual_ip_index() == index)
+    return true;
+  for (const auto &sta : this->sta_) {
+    if (sta.get_manual_ip_index() == index)
+      return true;
+  }
+  return false;
 }
 #endif
 
