@@ -6,4 +6,5 @@ Change of this branch: Improv serial RPCs 0x85 / 0x86 / 0x87: name, friendly nam
 
 Based on these branches, whose changes it holds and builds on:
 
+- `pr/improv-serial-network`: Improv serial RPC 0x80: interfaces in priority order, on / off, DHCP or a manual address
 - `pr/network-name-from-nvs`: `name_from_nvs`: device name and friendly name from the NVS for every network component
