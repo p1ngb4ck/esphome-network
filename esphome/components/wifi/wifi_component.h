@@ -5,6 +5,7 @@
 #include "esphome/components/network/ip_address.h"
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
+#include "esphome/core/entity_list.h"
 #include "esphome/core/helpers.h"
 #ifdef USE_ESP32
 #include "esphome/core/lock_free_queue.h"
@@ -514,8 +515,10 @@ class WiFiComponent final : public Component {
   void set_sta(const WiFiAP &ap);
   // Returns a copy of the currently selected AP configuration
   WiFiAP get_sta() const;
-  // init_sta/add_sta kept out of line: inlining them into the generated setup() grows flash
+  // add_sta kept out of line: inlining it into the generated setup() grows flash
+#ifdef USE_WIFI_SAVED_NETWORKS
   void init_sta(size_t count);
+#endif
   void add_sta(const WiFiAP &ap);
 #ifdef USE_WIFI_MANUAL_IP
   bool manual_ip_index_in_use(uint8_t index) const;
@@ -700,6 +703,12 @@ class WiFiComponent final : public Component {
 #ifdef USE_WIFI_DISCONNECT_TRIGGER
   Trigger<> *get_disconnect_trigger() { return &this->disconnect_trigger_; }
 #endif
+#ifdef USE_WIFI_AP_START_TRIGGER
+  void set_on_ap_start(void (*callback)()) { this->on_ap_start_ = callback; }
+#endif
+#ifdef USE_WIFI_AP_STOP_TRIGGER
+  void set_on_ap_stop(void (*callback)()) { this->on_ap_stop_ = callback; }
+#endif
 
   int32_t get_wifi_channel();
 
@@ -707,12 +716,14 @@ class WiFiComponent final : public Component {
   /** Add a listener for IP state changes.
    * Listener receives: IP addresses, DNS address 1, DNS address 2
    */
-  void add_ip_state_listener(WiFiIPStateListener *listener) { this->ip_state_listeners_.push_back(listener); }
+  void add_ip_state_listener(WiFiIPStateListener *listener) {
+    this->add_listener_(this->ip_state_listeners_, listener);
+  }
 #endif  // USE_WIFI_IP_STATE_LISTENERS
 #ifdef USE_WIFI_SCAN_RESULTS_LISTENERS
   /// Add a listener for WiFi scan results
   void add_scan_results_listener(WiFiScanResultsListener *listener) {
-    this->scan_results_listeners_.push_back(listener);
+    this->add_listener_(this->scan_results_listeners_, listener);
   }
 #endif  // USE_WIFI_SCAN_RESULTS_LISTENERS
   /// The WiFi start-up is done (main loop, once per boot): connected, or the first attempt ended without a
@@ -727,14 +738,16 @@ class WiFiComponent final : public Component {
    * Listener receives: SSID, BSSID
    */
   void add_connect_state_listener(WiFiConnectStateListener *listener) {
-    this->connect_state_listeners_.push_back(listener);
+    this->add_listener_(this->connect_state_listeners_, listener);
   }
 #endif  // USE_WIFI_CONNECT_STATE_LISTENERS
 #ifdef USE_WIFI_POWER_SAVE_LISTENERS
   /** Add a listener for WiFi power save mode changes.
    * Listener receives: WiFiPowerSaveMode
    */
-  void add_power_save_listener(WiFiPowerSaveListener *listener) { this->power_save_listeners_.push_back(listener); }
+  void add_power_save_listener(WiFiPowerSaveListener *listener) {
+    this->add_listener_(this->power_save_listeners_, listener);
+  }
 #endif  // USE_WIFI_POWER_SAVE_LISTENERS
 
 #ifdef USE_WIFI_RUNTIME_POWER_SAVE
@@ -864,9 +877,12 @@ class WiFiComponent final : public Component {
   bool ssid_was_seen_in_scan_(const CompactString &ssid) const;
   /// Check if full scan results are needed (captive portal active, improv, listeners)
   bool needs_full_scan_results_() const;
-  /// Check if network matches any configured network (for scan result filtering)
+  /// The configured network a scan result belongs to, or nullptr (for scan result filtering)
   /// Matches by SSID when configured, or by BSSID for BSSID-only configs
-  bool matches_configured_network_(const char *ssid, const uint8_t *bssid) const;
+  const WiFiAP *find_configured_network_(const char *ssid, const uint8_t *bssid) const;
+  bool matches_configured_network_(const char *ssid, const uint8_t *bssid) const {
+    return this->find_configured_network_(ssid, bssid) != nullptr;
+  }
   /// Log a discarded scan result at VERBOSE level (skipped during roaming scans to avoid log overflow)
   void log_discarded_scan_result_(const char *ssid, const uint8_t *bssid, int8_t rssi, uint8_t channel);
   /// Find next SSID that wasn't in scan results (might be hidden)
@@ -910,6 +926,8 @@ class WiFiComponent final : public Component {
   bool wifi_sta_pre_setup_();
   bool wifi_apply_output_power_(float output_power);
   bool wifi_apply_power_save_();
+  /// Output power and power save, wherever the radio first comes up: start() with networks, the AP without.
+  void apply_radio_settings_();
 #if defined(USE_ESP32) && defined(SOC_WIFI_SUPPORT_5G)
   bool wifi_apply_band_mode_();
 #endif
@@ -1056,24 +1074,30 @@ class WiFiComponent final : public Component {
 #endif
 
   // Large/pointer-aligned members first
-  FixedVector<WiFiAP> sta_;
   std::vector<WiFiSTAPriority> sta_priorities_;
   // Guarded by ScanResultsLock (see below this class)
   wifi_scan_vector_t<WiFiScanResult> scan_result_;
+  template<typename L> static void remove_listener_(void *list, void *listener, void *unused) {
+    static_cast<L *>(list)->remove(static_cast<typename L::value_type>(listener));
+  }
+  template<typename L> void add_listener_(L &list, typename L::value_type listener) {
+    list.push_back(listener);
+    note_registration(&WiFiComponent::remove_listener_<L>, &list, listener, nullptr);
+  }
 #ifdef WIFI_SCAN_RESULTS_LOCK_ENABLED
   Mutex scan_result_lock_;
 #endif
 #ifdef USE_WIFI_IP_STATE_LISTENERS
-  StaticVector<WiFiIPStateListener *, ESPHOME_WIFI_IP_STATE_LISTENERS> ip_state_listeners_;
+  EntityList<WiFiIPStateListener *, ESPHOME_WIFI_IP_STATE_LISTENERS> ip_state_listeners_;
 #endif
 #ifdef USE_WIFI_SCAN_RESULTS_LISTENERS
-  StaticVector<WiFiScanResultsListener *, ESPHOME_WIFI_SCAN_RESULTS_LISTENERS> scan_results_listeners_;
+  EntityList<WiFiScanResultsListener *, ESPHOME_WIFI_SCAN_RESULTS_LISTENERS> scan_results_listeners_;
 #endif
 #ifdef USE_WIFI_CONNECT_STATE_LISTENERS
-  StaticVector<WiFiConnectStateListener *, ESPHOME_WIFI_CONNECT_STATE_LISTENERS> connect_state_listeners_;
+  EntityList<WiFiConnectStateListener *, ESPHOME_WIFI_CONNECT_STATE_LISTENERS> connect_state_listeners_;
 #endif
 #ifdef USE_WIFI_POWER_SAVE_LISTENERS
-  StaticVector<WiFiPowerSaveListener *, ESPHOME_WIFI_POWER_SAVE_LISTENERS> power_save_listeners_;
+  EntityList<WiFiPowerSaveListener *, ESPHOME_WIFI_POWER_SAVE_LISTENERS> power_save_listeners_;
 #endif
   ESPPreferenceObject pref_;
 #ifdef USE_WIFI_SAVED_NETWORKS
@@ -1102,6 +1126,12 @@ class WiFiComponent final : public Component {
 #endif
 #ifdef USE_WIFI_DISCONNECT_TRIGGER
   Trigger<> disconnect_trigger_;
+#endif
+#ifdef USE_WIFI_AP_START_TRIGGER
+  void (*on_ap_start_)(){nullptr};
+#endif
+#ifdef USE_WIFI_AP_STOP_TRIGGER
+  void (*on_ap_stop_)(){nullptr};
 #endif
 #if defined(USE_ESP32) && defined(USE_WIFI_RUNTIME_POWER_SAVE)
   SemaphoreHandle_t high_performance_semaphore_{nullptr};
@@ -1244,6 +1274,9 @@ class WiFiComponent final : public Component {
 #if defined(USE_WIFI_CONNECT_TRIGGER) || defined(USE_WIFI_DISCONNECT_TRIGGER)
   bool handled_connected_state_{false};
 #endif
+#if defined(USE_WIFI_AP_START_TRIGGER) || defined(USE_WIFI_AP_STOP_TRIGGER)
+  bool handled_ap_state_{false};
+#endif
   bool scan_done_{false};
   bool ap_setup_{false};
   bool ap_started_{false};
@@ -1307,6 +1340,12 @@ class WiFiComponent final : public Component {
 #else
   FreeRTOSQueue<LTWiFiEvent, LT_EVENT_QUEUE_SIZE> event_queue_;
 #endif
+#endif
+  // Last, so the inline network slots do not push the other members past short load offsets
+#ifdef USE_WIFI_SAVED_NETWORKS
+  FixedVector<WiFiAP> sta_;
+#else
+  StaticVector<WiFiAP, WIFI_NETWORK_COUNT> sta_;
 #endif
 
  private:
